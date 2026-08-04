@@ -41,3 +41,8 @@
 
 - 当前为个人使用快速实现，触发模型（`gpt-5.2`）、供应商名称（`DeepSeek`）、上游模型（`deepseek-v4-flash`）为硬编码，如需通用化可后续改为可配置。
 - 打包产物为 ad-hoc 签名（未使用 Apple Developer 证书），仅适合个人使用。
+
+## 精简版说明（v3.19.1-ds52.2）
+
+- 主界面仅保留 Codex 模型切换与用量统计入口，隐藏了 Skills / 提示词 / 会话管理 / MCP 等其他功能入口（底层代码保留以保证代理稳定）。
+- 双击打开 CC Switch 会自动拉起 Codex 桌面端（macOS bundle id `com.openai.codex`）。

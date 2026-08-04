@@ -34,6 +34,23 @@ pub async fn open_external(app: AppHandle, url: String) -> Result<bool, String> 
     Ok(true)
 }
 
+/// 拉起 Codex 桌面端（macOS 上为 bundle id com.openai.codex）
+#[tauri::command]
+pub fn launch_codex() -> Result<bool, String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-b", "com.openai.codex"])
+            .spawn()
+            .map_err(|e| format!("打开 Codex 失败: {e}"))?;
+        Ok(true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("launch_codex 仅支持 macOS".to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn copy_text_to_clipboard(text: String) -> Result<bool, String> {
     // Use spawn_blocking to avoid blocking the async runtime

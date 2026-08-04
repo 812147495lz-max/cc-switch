@@ -12,7 +12,7 @@ import {
   Maximize2,
   Minimize2,
   X,
-  Book,
+  ExternalLink,
   Brain,
   Wrench,
   History,
@@ -120,24 +120,8 @@ interface SyncStatusUpdatedPayload {
 const DEFAULT_DRAG_BAR_HEIGHT = isWindows() || isLinux() ? 0 : 28; // px
 const HEADER_HEIGHT = 64; // px
 
-const STORAGE_KEY = "cc-switch-last-app";
-const VALID_APPS: AppId[] = [
-  "claude",
-  "claude-desktop",
-  "codex",
-  "gemini",
-  "grokbuild",
-  "opencode",
-  "openclaw",
-  "hermes",
-];
-
 const getInitialApp = (): AppId => {
-  const saved = localStorage.getItem(STORAGE_KEY) as AppId | null;
-  if (saved && VALID_APPS.includes(saved)) {
-    return saved;
-  }
-  return "claude";
+  return "codex";
 };
 
 const VIEW_STORAGE_KEY = "cc-switch-last-view";
@@ -189,15 +173,16 @@ function App() {
     isLinux() && (settingsData?.useAppWindowControls ?? false);
   const dragBarHeight = useAppWindowControls ? 32 : DEFAULT_DRAG_BAR_HEIGHT;
   const contentTopOffset = dragBarHeight + HEADER_HEIGHT;
-  const visibleApps: VisibleApps = settingsData?.visibleApps ?? {
-    claude: true,
-    "claude-desktop": true,
+  // 精简版：仅保留 Codex 供应商切换
+  const visibleApps: VisibleApps = {
+    claude: false,
+    "claude-desktop": false,
     codex: true,
-    gemini: true,
-    grokbuild: true,
-    opencode: true,
-    openclaw: true,
-    hermes: true,
+    gemini: false,
+    grokbuild: false,
+    opencode: false,
+    openclaw: false,
+    hermes: false,
   };
 
   const getFirstVisibleApp = (): AppId => {
@@ -287,16 +272,6 @@ function App() {
       currentView === "openclawAgents");
   const { data: openclawHealthWarnings = [] } =
     useOpenClawHealth(isOpenClawView);
-  const hasSkillsSupport = sharedFeatureApp !== "openclaw";
-  const hasSessionSupport =
-    sharedFeatureApp === "claude" ||
-    sharedFeatureApp === "codex" ||
-    sharedFeatureApp === "grokbuild" ||
-    sharedFeatureApp === "opencode" ||
-    sharedFeatureApp === "openclaw" ||
-    sharedFeatureApp === "gemini" ||
-    sharedFeatureApp === "hermes";
-
   const {
     addProvider,
     updateProvider,
@@ -888,6 +863,25 @@ function App() {
     setSkillsDiscoverySource("repos");
     setCurrentView("skillsDiscovery");
   };
+
+  const launchCodex = async () => {
+    try {
+      await invoke("launch_codex");
+    } catch (error) {
+      toast.error(t("openCodexFailed", { defaultValue: "打开 Codex 失败" }), {
+        description: extractErrorMessage(error) || undefined,
+      });
+    }
+  };
+
+  // 打开 CC Switch 后自动拉起 Codex 桌面端
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      void launchCodex();
+    }, 2000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const renderContent = () => {
     const content = (() => {
@@ -1502,56 +1496,17 @@ function App() {
                               </Button>
                             </>
                           ) : (
-                            <>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => setCurrentView("skills")}
-                                className={cn(
-                                  "text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5",
-                                  "transition-all duration-200 ease-in-out overflow-hidden",
-                                  hasSkillsSupport
-                                    ? "opacity-100 w-8 scale-100 px-2"
-                                    : "opacity-0 w-0 scale-75 pointer-events-none px-0 -ml-1",
-                                )}
-                                title={t("skills.manage")}
-                              >
-                                <Wrench className="flex-shrink-0 w-4 h-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => setCurrentView("prompts")}
-                                className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                title={t("prompts.manage")}
-                              >
-                                <Book className="w-4 h-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => setCurrentView("sessions")}
-                                className={cn(
-                                  "text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5",
-                                  "transition-all duration-200 ease-in-out overflow-hidden",
-                                  hasSessionSupport
-                                    ? "opacity-100 w-8 scale-100 px-2"
-                                    : "opacity-0 w-0 scale-75 pointer-events-none px-0 -ml-1",
-                                )}
-                                title={t("sessionManager.title")}
-                              >
-                                <History className="flex-shrink-0 w-4 h-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => setCurrentView("mcp")}
-                                className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
-                                title={t("mcp.title")}
-                              >
-                                <McpIcon size={16} />
-                              </Button>
-                            </>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => void launchCodex()}
+                              className="text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/5 w-8 px-2"
+                              title={t("openCodex", {
+                                defaultValue: "打开 Codex",
+                              })}
+                            >
+                              <ExternalLink className="w-4 h-4" />
+                            </Button>
                           )}
                         </motion.div>
                       </AnimatePresence>
