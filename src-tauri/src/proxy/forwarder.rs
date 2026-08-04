@@ -1590,6 +1590,50 @@ impl RequestForwarder {
                 }
             }
         }
+        // 由 handler_context 保证 Codex 仅在选择 GPT-5.2 时进入 DeepSeek。
+        // 在所有协议转换完成后强制写入真实上游模型，兼容原生 Responses 和
+        // Responses -> Chat Completions 两种 DeepSeek 配置。
+        if matches!(app_type, AppType::Codex) && provider.name.eq_ignore_ascii_case("DeepSeek") {
+            filtered_body["model"] = Value::String("deepseek-v4-flash".to_string());
+        }
+        // 从 DeepSeek 切回 OpenAI Official 时，Codex 会重放第三方模型生成的
+        // reasoning 项。ChatGPT 账号后端不接受带非空 content 的明文 reasoning，
+        // 因此删除这类内部推理项，但保留普通 assistant message 和最终回答文本。
+        if matches!(app_type, AppType::Codex)
+            && provider.name.eq_ignore_ascii_case("OpenAI Official")
+        {
+            let mut removed_foreign_reasoning = 0usize;
+
+            if let Some(input) = filtered_body.get_mut("input").and_then(Value::as_array_mut) {
+                let before = input.len();
+
+                input.retain(|item| {
+                    let is_reasoning =
+                        item.get("type").and_then(Value::as_str) == Some("reasoning");
+
+                    let has_plain_reasoning_content = item
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|content| !content.is_empty());
+
+                    !(is_reasoning && has_plain_reasoning_content)
+                });
+
+                removed_foreign_reasoning = before.saturating_sub(input.len());
+            }
+
+            if removed_foreign_reasoning > 0 {
+                // DeepSeek 返回的 response id 不能用于续接 OpenAI 官方响应。
+                if let Some(body) = filtered_body.as_object_mut() {
+                    body.remove("previous_response_id");
+                }
+
+                log::info!(
+                    "[Codex] 切回 OpenAI Official：已移除 {} 个第三方明文 reasoning 项",
+                    removed_foreign_reasoning
+                );
+            }
+        }
         // 出站 body 定稿后刷新真值（覆盖 Codex chat 上游模型覆写、转换层模型改写）
         if let Some(m) = filtered_body
             .get("model")

@@ -107,7 +107,7 @@ impl RequestContext {
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
         let copilot_optimizer_config = state.db.get_copilot_optimizer_config().unwrap_or_default();
 
-        let current_provider_id =
+        let configured_current_provider_id =
             crate::settings::get_current_provider(&app_type).unwrap_or_default();
 
         // 从请求体提取模型名称
@@ -129,19 +129,64 @@ impl RequestContext {
             session_result.client_provided
         );
 
-        // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
-        // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
-        let providers = state
-            .provider_router
-            .select_providers(app_type_str)
-            .await
-            .map_err(|e| match e {
-                crate::error::AppError::AllProvidersCircuitOpen => {
-                    ProxyError::AllProvidersCircuitOpen
-                }
-                crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
-                _ => ProxyError::DatabaseError(e.to_string()),
-            })?;
+        // Codex 按模型分流：GPT-5.2 作为 DeepSeek V4 Flash 的菜单入口；
+        // 其他 Codex 模型继续使用 OpenAI Official。
+        let (providers, current_provider_id) = if app_type_str == "codex" {
+            let all_providers = state
+                .db
+                .get_all_providers(app_type_str)
+                .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
+
+            let route_to_deepseek =
+                request_model == "gpt-5.2" || request_model.starts_with("gpt-5.2-");
+
+            let target_provider = if route_to_deepseek {
+                all_providers
+                    .values()
+                    .find(|provider| provider.name.eq_ignore_ascii_case("DeepSeek"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProxyError::InvalidRequest(
+                            "未找到名称为 DeepSeek 的 Codex 供应商".to_string(),
+                        )
+                    })?
+            } else {
+                all_providers
+                    .get("codex-official")
+                    .or_else(|| {
+                        all_providers
+                            .values()
+                            .find(|provider| provider.name.eq_ignore_ascii_case("OpenAI Official"))
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        ProxyError::InvalidRequest(
+                            "未找到 OpenAI Official Codex 供应商".to_string(),
+                        )
+                    })?
+            };
+
+            // 告诉 forwarder 这是本次请求的预期供应商，避免它把按模型分流
+            // 误判成故障转移并修改 CC Switch 主界面的当前供应商。
+            let selected_provider_id = target_provider.id.clone();
+            (vec![target_provider], selected_provider_id)
+        } else {
+            // 其他应用维持原有 ProviderRouter / 故障转移逻辑。
+            let providers = state
+                .provider_router
+                .select_providers(app_type_str)
+                .await
+                .map_err(|e| match e {
+                    crate::error::AppError::AllProvidersCircuitOpen => {
+                        ProxyError::AllProvidersCircuitOpen
+                    }
+                    crate::error::AppError::NoProvidersConfigured => {
+                        ProxyError::NoProvidersConfigured
+                    }
+                    _ => ProxyError::DatabaseError(e.to_string()),
+                })?;
+            (providers, configured_current_provider_id)
+        };
 
         let provider = providers
             .first()
