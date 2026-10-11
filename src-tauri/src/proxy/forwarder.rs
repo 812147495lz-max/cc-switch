@@ -33,7 +33,7 @@ use crate::{
 use bytes::Bytes;
 use futures::StreamExt;
 use http::Extensions;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -1375,6 +1375,18 @@ impl RequestForwarder {
                 .as_deref()
                 .unwrap_or_else(|| super::providers::get_claude_api_format(provider));
             rewrite_claude_transform_endpoint(endpoint, api_format, is_copilot, &mapped_body)
+        } else if matches!(app_type, AppType::Codex)
+            && provider.name.eq_ignore_ascii_case("DeepSeek")
+            && is_codex_compact_endpoint(endpoint)
+        {
+            // DeepSeek 没有 /responses/compact 端点（上游 404）。压缩请求改用普通
+            // /responses，并在请求体中注入压缩摘要指令（见下方 compact 指令注入）。
+            (
+                rewrite_codex_compact_endpoint_to_responses(endpoint),
+                split_endpoint_and_query(endpoint)
+                    .1
+                    .map(ToString::to_string),
+            )
         } else {
             (
                 endpoint.to_string(),
@@ -1595,6 +1607,9 @@ impl RequestForwarder {
         // Responses -> Chat Completions 两种 DeepSeek 配置。
         if matches!(app_type, AppType::Codex) && provider.name.eq_ignore_ascii_case("DeepSeek") {
             filtered_body["model"] = Value::String("deepseek-v4-flash".to_string());
+            if is_codex_compact_endpoint(endpoint) {
+                inject_codex_compact_instruction(&mut filtered_body);
+            }
         }
         // 从 DeepSeek 切回 OpenAI Official 时，Codex 会重放第三方模型生成的
         // reasoning 项。ChatGPT 账号后端不接受带非空 content 的明文 reasoning，
@@ -1602,6 +1617,19 @@ impl RequestForwarder {
         if matches!(app_type, AppType::Codex)
             && provider.name.eq_ignore_ascii_case("OpenAI Official")
         {
+            // 遗留保险：Codex 远程压缩现在统一由 handler_context 路由到 DeepSeek，
+            // 正常不再走到这里。仅当其它 app（如 GrokBuild）把 gpt-5.2 别名发给
+            // OpenAI Official 的 compact 接口时，才把别名改写为官方支持模型。
+            if is_codex_compact_endpoint(endpoint)
+                && filtered_body
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .is_some_and(|model| model == "gpt-5.2" || model.starts_with("gpt-5.2-"))
+            {
+                filtered_body["model"] = Value::String("gpt-5.6-sol".to_string());
+                log::info!("[Codex] GPT-5.2 混合路由：远程压缩改用 OpenAI Official gpt-5.6-sol");
+            }
+
             let mut removed_foreign_reasoning = 0usize;
 
             if let Some(input) = filtered_body.get_mut("input").and_then(Value::as_array_mut) {
@@ -2742,6 +2770,40 @@ impl RequestForwarder {
             // 其他错误（数据库/内部错误等）：不是换供应商能解决的问题
             _ => ErrorCategory::NonRetryable,
         }
+    }
+}
+
+fn is_codex_compact_endpoint(endpoint: &str) -> bool {
+    matches!(
+        split_endpoint_and_query(endpoint).0,
+        "/responses/compact" | "/v1/responses/compact"
+    )
+}
+
+/// 把 compact 端点改写为普通 responses 端点（去掉 `/compact` 后缀，保留查询串）。
+fn rewrite_codex_compact_endpoint_to_responses(endpoint: &str) -> String {
+    let (path, query) = split_endpoint_and_query(endpoint);
+    let new_path = path.strip_suffix("/compact").unwrap_or(path).to_string();
+    match query {
+        Some(query) => format!("{new_path}?{query}"),
+        None => new_path,
+    }
+}
+
+/// 在 compact 请求体中追加压缩摘要指令，让 DeepSeek 用普通 /responses 完成
+/// “对话压缩”任务；返回的 message 文本会被 handlers 转换为 compaction 项。
+fn inject_codex_compact_instruction(body: &mut Value) {
+    const INSTRUCTION: &str = "You are performing a CONTEXT CHECKPOINT COMPACTION. \
+Create a concise handoff summary of the conversation above that preserves all task context, \
+decisions, open items, constraints, and any important details for another LLM that will resume \
+the task. Output only the summary text, with no preamble.";
+
+    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
+        input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": INSTRUCTION}]
+        }));
     }
 }
 
@@ -4491,6 +4553,50 @@ mod tests {
 
         assert_eq!(endpoint, "/chat/completions?foo=bar");
         assert_eq!(passthrough_query.as_deref(), Some("foo=bar"));
+    }
+
+    #[test]
+    fn rewrite_codex_compact_endpoint_to_responses_strips_compact_suffix() {
+        assert_eq!(
+            rewrite_codex_compact_endpoint_to_responses("/v1/responses/compact?stream=true"),
+            "/v1/responses?stream=true"
+        );
+        assert_eq!(
+            rewrite_codex_compact_endpoint_to_responses("/responses/compact"),
+            "/responses"
+        );
+        assert_eq!(
+            rewrite_codex_compact_endpoint_to_responses("/v1/responses"),
+            "/v1/responses"
+        );
+    }
+
+    #[test]
+    fn inject_codex_compact_instruction_appends_summary_prompt() {
+        let mut body = json!({
+            "model": "gpt-5.2",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+            ],
+            "stream": true
+        });
+
+        inject_codex_compact_instruction(&mut body);
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["role"], "user");
+        let text = input[1]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("CONTEXT CHECKPOINT COMPACTION"));
+    }
+
+    #[test]
+    fn inject_codex_compact_instruction_handles_missing_input() {
+        let mut body = json!({"model": "gpt-5.2", "stream": true});
+
+        inject_codex_compact_instruction(&mut body);
+
+        assert!(body.get("input").is_none());
     }
 
     #[test]

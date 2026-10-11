@@ -803,8 +803,20 @@ async fn handle_responses_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+    let is_compaction = is_codex_compaction_request(&body);
+    let mut ctx = if is_compaction && matches!(app_type, AppType::Codex) {
+        RequestContext::new_for_codex_compaction(
+            &state,
+            &body,
+            &headers,
+            app_type.clone(),
+            tag,
+            app_type_str,
+        )
+        .await?
+    } else {
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?
+    };
     let endpoint = endpoint_with_query(&uri, "/responses");
 
     let is_stream = body
@@ -844,6 +856,20 @@ async fn handle_responses_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    // Codex 桌面端自动压缩（RemoteCompactionV2）以普通 /responses 请求发起，
+    // 由 client_metadata 标记 request_kind=compaction。这里把 DeepSeek 的
+    // message/reasoning 输出项收敛成 Codex 要求的唯一 compaction output item。
+    if is_compaction && ctx.provider.name.eq_ignore_ascii_case("DeepSeek") {
+        return handle_codex_deepseek_compact_transform(
+            response,
+            &ctx,
+            &state,
+            is_stream,
+            connection_guard,
+        )
+        .await;
+    }
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
         return handle_codex_anthropic_to_responses_transform(
@@ -940,8 +966,19 @@ async fn handle_responses_compact_for_app(
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
 
-    let mut ctx =
-        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
+    let mut ctx = if matches!(app_type, AppType::Codex) {
+        RequestContext::new_for_codex_compaction(
+            &state,
+            &body,
+            &headers,
+            app_type.clone(),
+            tag,
+            app_type_str,
+        )
+        .await?
+    } else {
+        RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?
+    };
     let endpoint = endpoint_with_query(&uri, "/responses/compact");
 
     let is_stream = body
@@ -978,6 +1015,21 @@ async fn handle_responses_compact_for_app(
     ctx.outbound_model = result.outbound_model.take();
     ctx.provider = result.provider;
     let response = result.response;
+
+    // Codex 远程压缩统一走 DeepSeek（见 handler_context::new_for_codex_compaction）。
+    // DeepSeek 的原生 Responses 接口只返回 message/reasoning 输出项，这里把它
+    // 收敛成 Codex 要求的唯一 compaction output item。
+    if ctx.provider.name.eq_ignore_ascii_case("DeepSeek") && is_responses_compact_endpoint(&endpoint)
+    {
+        return handle_codex_deepseek_compact_transform(
+            response,
+            &ctx,
+            &state,
+            is_stream,
+            connection_guard,
+        )
+        .await;
+    }
 
     if super::providers::should_convert_codex_responses_to_anthropic(&ctx.provider, &endpoint) {
         return handle_codex_anthropic_to_responses_transform(
@@ -1024,6 +1076,195 @@ async fn handle_responses_compact_for_app(
         connection_guard,
     )
     .await
+}
+
+/// 判断端点是否为 Codex 远程压缩接口（忽略查询串）。
+fn is_responses_compact_endpoint(endpoint: &str) -> bool {
+    let path = endpoint.split_once('?').map_or(endpoint, |(path, _)| path);
+    matches!(path, "/responses/compact" | "/v1/responses/compact")
+}
+
+/// 判断是否为 Codex 桌面端自动压缩请求（RemoteCompactionV2）。
+///
+/// 桌面端把上下文压缩实现为普通 `/responses` 请求，并在
+/// `client_metadata.x-codex-turn-metadata`（JSON 字符串）中标记
+/// `request_kind = "compaction"`，同时附带 `compaction` 描述对象。
+fn is_codex_compaction_request(body: &Value) -> bool {
+    let Some(meta) = body
+        .pointer("/client_metadata/x-codex-turn-metadata")
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let Ok(meta) = serde_json::from_str::<Value>(meta) else {
+        return false;
+    };
+    meta.get("request_kind").and_then(Value::as_str) == Some("compaction")
+        || meta.get("compaction").is_some()
+}
+
+/// 把 DeepSeek 的 compact 响应（message/reasoning 输出项）改写为 Codex 要求的
+/// 单个 compaction output item：以 message 的 output_text 文本作为压缩摘要。
+fn convert_compact_output_to_compaction(response: &mut Value) -> Result<(), ProxyError> {
+    let obj = response.as_object_mut().ok_or_else(|| {
+        ProxyError::TransformError("DeepSeek compact 响应不是 JSON 对象".to_string())
+    })?;
+
+    let summary = obj
+        .get("output")
+        .and_then(|output| output.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+                .filter_map(|item| item.get("content").and_then(Value::as_array))
+                .flatten()
+                .filter(|part| part.get("type").and_then(Value::as_str) == Some("output_text"))
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<&str>>()
+                .join("")
+        })
+        .unwrap_or_default();
+
+    let item_id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|rid| format!("{rid}-compaction"))
+        .unwrap_or_else(|| "compaction-1".to_string());
+
+    let item = json!({
+        "id": item_id,
+        "type": "compaction",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": summary}],
+    });
+
+    obj.insert("output".to_string(), Value::Array(vec![item]));
+    Ok(())
+}
+
+/// DeepSeek 原生 Responses compact 响应 → Codex 可识别的 compaction 响应。
+///
+/// 流式上游先聚合为 JSON 再重放为标准 Responses SSE 事件序列
+/// （created → output_item.added → output_item.done → completed）；
+/// 非流式直接返回改写后的 JSON。压缩摘要体积很小，整包缓冲可接受。
+async fn handle_codex_deepseek_compact_transform(
+    response: super::hyper_client::ProxyResponse,
+    ctx: &RequestContext,
+    state: &ProxyState,
+    is_stream: bool,
+    connection_guard: Option<ActiveConnectionGuard>,
+) -> Result<axum::response::Response, ProxyError> {
+    let status = response.status();
+    if !status.is_success() {
+        return process_response(response, ctx, state, &CODEX_PARSER_CONFIG, connection_guard).await;
+    }
+
+    let was_sse = is_stream || response.is_sse();
+    let body_timeout = if was_sse {
+        let cfg = ctx.streaming_timeout_config();
+        if cfg.first_byte_timeout > 0 || cfg.idle_timeout > 0 {
+            std::time::Duration::from_secs(cfg.first_byte_timeout.max(cfg.idle_timeout))
+        } else {
+            std::time::Duration::ZERO
+        }
+    } else if ctx.app_config.auto_failover_enabled && ctx.app_config.non_streaming_timeout > 0 {
+        std::time::Duration::from_secs(ctx.app_config.non_streaming_timeout as u64)
+    } else {
+        std::time::Duration::ZERO
+    };
+
+    let (mut response_headers, status, body_bytes) =
+        read_decoded_body(response, ctx.tag, body_timeout).await?;
+    let body_str = String::from_utf8_lossy(&body_bytes);
+
+    let mut responses_response: Value = if was_sse || body_looks_like_sse(&body_str) {
+        responses_sse_to_response_value(&body_str)?
+    } else {
+        serde_json::from_slice(&body_bytes).map_err(|e| {
+            log::error!(
+                "[Codex] 解析 DeepSeek compact 响应失败: {e}, body_bytes={}",
+                body_bytes.len()
+            );
+            ProxyError::TransformError(format!(
+                "Failed to parse DeepSeek compact response: {e}"
+            ))
+        })?
+    };
+
+    convert_compact_output_to_compaction(&mut responses_response)?;
+
+    if was_sse {
+        let item = responses_response
+            .pointer("/output/0")
+            .cloned()
+            .unwrap_or_else(|| {
+                json!({
+                    "id": "compaction-1",
+                    "type": "compaction",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": ""}],
+                })
+            });
+        let mut added_item = item.clone();
+        if let Some(obj) = added_item.as_object_mut() {
+            obj.insert("status".to_string(), json!("in_progress"));
+            obj.insert("content".to_string(), json!([]));
+        }
+        let mut completed_response = responses_response.clone();
+        if let Some(obj) = completed_response.as_object_mut() {
+            obj.insert("status".to_string(), json!("completed"));
+        }
+        let mut in_progress_response = completed_response.clone();
+        if let Some(obj) = in_progress_response.as_object_mut() {
+            obj.insert("status".to_string(), json!("in_progress"));
+        }
+
+        let events = vec![
+            super::providers::codex_responses_sse::response_created(&in_progress_response),
+            super::providers::codex_responses_sse::output_item_added(0, &added_item),
+            super::providers::codex_responses_sse::output_item_done(0, &item),
+            super::providers::codex_responses_sse::response_completed(&completed_response),
+        ];
+        let stream =
+            futures::stream::iter(events.into_iter().map(Ok::<Bytes, std::io::Error>));
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+        let body = axum::body::Body::from_stream(stream);
+        return Ok((headers, body).into_response());
+    }
+
+    strip_entity_headers_for_rebuilt_body(&mut response_headers);
+    strip_hop_by_hop_response_headers(&mut response_headers);
+    response_headers.remove(axum::http::header::CONTENT_TYPE);
+
+    let mut builder = axum::response::Response::builder().status(status);
+    for (key, value) in response_headers.iter() {
+        builder = builder.header(key, value);
+    }
+    builder = builder.header(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let response_body = serde_json::to_vec(&responses_response).map_err(|e| {
+        log::error!("[Codex] 序列化 DeepSeek compact 响应失败: {e}");
+        ProxyError::TransformError(format!("Failed to serialize compact response: {e}"))
+    })?;
+
+    builder
+        .body(axum::body::Body::from(response_body))
+        .map_err(|e| {
+            log::error!("[Codex] 构建 DeepSeek compact 响应失败: {e}");
+            ProxyError::Internal(format!("Failed to build response: {e}"))
+        })
 }
 
 /// Response handler for the native Responses passthrough to a strict gateway
@@ -2657,10 +2898,146 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_to_response_value,
-        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
+        codex_proxy_error_json, convert_compact_output_to_compaction, is_codex_compaction_request,
+        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
+        upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
+    use serde_json::json;
+
+    #[test]
+    fn detects_codex_compaction_via_turn_metadata() {
+        let body = json!({
+            "model": "gpt-5.2",
+            "client_metadata": {
+                "x-codex-turn-metadata": json!({
+                    "request_kind": "compaction",
+                    "compaction": {
+                        "trigger": "auto",
+                        "reason": "context_limit",
+                        "implementation": "responses_compaction_v2",
+                        "phase": "pre_turn",
+                        "strategy": "memento"
+                    }
+                }).to_string()
+            }
+        });
+        assert!(is_codex_compaction_request(&body));
+    }
+
+    #[test]
+    fn regular_requests_are_not_detected_as_compaction() {
+        let body = json!({
+            "model": "gpt-5.2",
+            "client_metadata": {
+                "x-codex-turn-metadata": json!({"request_kind": "turn"}).to_string()
+            }
+        });
+        assert!(!is_codex_compaction_request(&body));
+
+        let bare = json!({ "model": "gpt-5.2" });
+        assert!(!is_codex_compaction_request(&bare));
+    }
+
+    #[test]
+    fn deepseek_compact_response_collapses_to_single_compaction_item() {
+        let mut response = json!({
+            "id": "resp_deepseek_1",
+            "object": "response",
+            "model": "deepseek-v4-flash",
+            "output": [
+                {
+                    "id": "rs_1",
+                    "type": "reasoning",
+                    "status": "completed",
+                    "content": [{"type": "reasoning_text", "text": "internal"}]
+                },
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "压缩后的摘要内容"}]
+                }
+            ]
+        });
+
+        convert_compact_output_to_compaction(&mut response).unwrap();
+
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "compaction");
+        assert_eq!(output[0]["status"], "completed");
+        assert_eq!(output[0]["content"][0]["text"], "压缩后的摘要内容");
+        assert_eq!(output[0]["id"], "resp_deepseek_1-compaction");
+    }
+
+    #[test]
+    fn deepseek_compact_response_joins_multiple_text_parts() {
+        let mut response = json!({
+            "id": "resp_deepseek_2",
+            "object": "response",
+            "output": [
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "part1"},
+                        {"type": "output_text", "text": "part2"}
+                    ]
+                }
+            ]
+        });
+
+        convert_compact_output_to_compaction(&mut response).unwrap();
+
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["content"][0]["text"], "part1part2");
+    }
+
+    #[test]
+    fn deepseek_compact_response_without_message_yields_empty_summary() {
+        let mut response = json!({
+            "id": "resp_deepseek_3",
+            "object": "response",
+            "output": []
+        });
+
+        convert_compact_output_to_compaction(&mut response).unwrap();
+
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "compaction");
+        assert_eq!(output[0]["content"][0]["text"], "");
+    }
+
+    #[test]
+    fn deepseek_compact_response_keeps_unrelated_top_level_fields() {
+        let mut response = json!({
+            "id": "resp_deepseek_4",
+            "object": "response",
+            "model": "deepseek-v4-flash",
+            "usage": {"input_tokens": 10, "output_tokens": 5},
+            "output": [
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "summary"}]
+                }
+            ]
+        });
+
+        convert_compact_output_to_compaction(&mut response).unwrap();
+
+        assert_eq!(response["id"], "resp_deepseek_4");
+        assert_eq!(response["usage"]["input_tokens"], 10);
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {

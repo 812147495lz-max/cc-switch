@@ -93,6 +93,37 @@ impl RequestContext {
         tag: &'static str,
         app_type_str: &'static str,
     ) -> Result<Self, ProxyError> {
+        Self::new_with_codex_model_routing(state, body, headers, app_type, tag, app_type_str, true)
+            .await
+    }
+
+    /// 创建 Codex 远程压缩请求上下文。
+    ///
+    /// `/responses/compact` 是 OpenAI/Codex 专用协议：第三方 Responses
+    /// 供应商通常只会返回 reasoning/message，而不会返回 Codex 要求的唯一
+    /// compaction output item（该形状由 handlers 的 DeepSeek 转换层补全）。
+    /// 压缩请求统一走 DeepSeek，避免依赖 OpenAI 账号配额。
+    pub async fn new_for_codex_compaction(
+        state: &ProxyState,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+        app_type: AppType,
+        tag: &'static str,
+        app_type_str: &'static str,
+    ) -> Result<Self, ProxyError> {
+        Self::new_with_codex_model_routing(state, body, headers, app_type, tag, app_type_str, false)
+            .await
+    }
+
+    async fn new_with_codex_model_routing(
+        state: &ProxyState,
+        body: &serde_json::Value,
+        headers: &HeaderMap,
+        app_type: AppType,
+        tag: &'static str,
+        app_type_str: &'static str,
+        allow_codex_model_routing: bool,
+    ) -> Result<Self, ProxyError> {
         let start_time = Instant::now();
 
         // 从数据库读取应用级代理配置（per-app）
@@ -138,7 +169,7 @@ impl RequestContext {
                 .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
 
             let route_to_deepseek =
-                request_model == "gpt-5.2" || request_model.starts_with("gpt-5.2-");
+                resolve_codex_route_to_deepseek(&request_model, allow_codex_model_routing);
 
             let target_provider = if route_to_deepseek {
                 all_providers
@@ -325,6 +356,14 @@ impl RequestContext {
     }
 }
 
+fn resolve_codex_route_to_deepseek(request_model: &str, allow_model_routing: bool) -> bool {
+    if !allow_model_routing {
+        // 远程压缩请求固定走 DeepSeek，与对话模型无关。
+        return true;
+    }
+    request_model == "gpt-5.2" || request_model.starts_with("gpt-5.2-")
+}
+
 /// Pull the Gemini model name out of an API path.
 ///
 /// Accepts forms like `/v1beta/models/gemini-pro:generateContent`,
@@ -345,7 +384,27 @@ pub(crate) fn extract_gemini_model_from_path(endpoint: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_gemini_model_from_path;
+    use super::{extract_gemini_model_from_path, resolve_codex_route_to_deepseek};
+
+    #[test]
+    fn regular_gpt_5_2_requests_route_to_deepseek() {
+        assert!(resolve_codex_route_to_deepseek("gpt-5.2", true));
+        assert!(resolve_codex_route_to_deepseek("gpt-5.2-high", true));
+    }
+
+    #[test]
+    fn regular_gpt_5_6_requests_stay_on_openai() {
+        assert!(!resolve_codex_route_to_deepseek("gpt-5.6-sol", true));
+        assert!(!resolve_codex_route_to_deepseek("gpt-5.6-luna", true));
+    }
+
+    #[test]
+    fn all_compact_requests_route_to_deepseek() {
+        assert!(resolve_codex_route_to_deepseek("gpt-5.2", false));
+        assert!(resolve_codex_route_to_deepseek("gpt-5.2-high", false));
+        assert!(resolve_codex_route_to_deepseek("gpt-5.6-sol", false));
+        assert!(resolve_codex_route_to_deepseek("gpt-5.6-luna", false));
+    }
 
     #[test]
     fn extract_model_with_action() {
